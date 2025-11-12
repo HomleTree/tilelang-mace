@@ -1,2 +1,2 @@
 # TensorProduct
-made 不要
+made by myself
