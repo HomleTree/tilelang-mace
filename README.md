@@ -1,2 +1,2 @@
-# TensorProduct
+# tilelang-mace
 made by myself
