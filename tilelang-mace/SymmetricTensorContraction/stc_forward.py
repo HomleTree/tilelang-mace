@@ -23,119 +23,209 @@ warnings.filterwarnings(
 )
 torch.manual_seed(42)
 
+# @tilelang.jit
+# def forward(B, m, U,
+#             dtype="float16", 
+#             accum_dtype="float32",
+#             threads=128):
+    
+#     # tile
+#     block_B = 32
+#     block_U = 32
+#     block_V = 64
+#     block_M = 16
+
+#     @T.prim_func
+#     def main(
+#             X1: T.Tensor((B, m, U), dtype), # type: ignore
+#             X0: T.Tensor((B, m, U), dtype), # type: ignore
+#             cg: T.Tensor((m,), dtype), # type: ignore
+#             out: T.Tensor((B, U), dtype), # type: ignore
+#     ):
+#         # T.func_attr({"tir.noalias": True})
+#         # T.func_attr({"tl.copy_vectorize": 4}) 
+#         # T.func_attr({"tl.tensor_mem_size": 48*1024})
+
+#         with T.Kernel(T.ceildiv(B, block_B), T.ceildiv(U, block_U), threads=threads) as (b_idx, u_idx):
+            
+#             X1_shared = T.alloc_shared((block_B, block_M, block_U), dtype)
+#             X0_shared = T.alloc_shared((block_B, block_M, block_U), dtype)
+#             cg_shared = T.alloc_shared((block_M,), dtype)
+
+#             Z_local = T.alloc_fragment((block_B, block_U), accum_dtype)
+#             T.clear(Z_local)
+
+#             # data_shared
+#             for mo in T.Pipelined(T.ceildiv(m, block_M), num_stages=3):
+#                 # X1_shared = T.alloc_shared((block_B, m, block_U), dtype)
+#                 # X0_shared = T.alloc_shared((block_B, m, block_U), dtype)
+#                 # cg_shared = T.alloc_shared((m,), dtype)
+
+#                 T.copy(X1[b_idx * block_B, mo*block_M, u_idx * block_U], X1_shared)
+#                 T.copy(X0[b_idx * block_B, mo*block_M, u_idx * block_U], X0_shared)
+#                 T.copy(cg[mo*block_M], cg_shared)
+
+#                 # T.gemm(X_shared, W_shared, Z_local)
+#                 for i, j, k in T.Parallel(block_B, block_U, block_M):
+#                     Z_local[i, j] += X1_shared[i, j, k] * X1_shared[i, j, k] * cg_shared[k]
+
+#             T.copy(Z_local, out[b_idx * block_B, u_idx * block_U])
+
+#     return main
+
+# @tilelang.jit
+# def forward(B, num_a, num_i, u, path_num, 
+#             dtype="float64", 
+#             accum_dtype="float64",
+#             threads=96):
+    
+#     # tile
+#     block_B = 32
+#     block_U = threads
+#     block_V = 64
+#     block_M = 16
+
+#     @T.prim_func
+#     def main(
+#             X1: T.Tensor((B, num_a, u), dtype), # type: ignore
+#             X0: T.Tensor((B, num_i, u), dtype), # type: ignore
+#             cg: T.Tensor((path_num,), dtype), # type: ignore
+#             paths: T.Tensor((path_num, 5), "int32"), # type: ignore
+#             path_lens: T.Tensor((path_num,), "int32"), # type: ignore
+#             out: T.Tensor((B, u), dtype), # type: ignore
+#     ):
+#         T.func_attr({"tir.noalias": True, "tl.copy_vectorize": 4})
+        
+#         with T.Kernel(B, T.ceildiv(u, block_U), threads=threads) as (b_idx, u_blk):
+            
+#             tx = T.thread_binding(0, block_U, "threadIdx.x")
+#             u_base = u_blk * block_U
+#             u_idx  = u_base + tx
+
+#             X1_shared = T.alloc_shared((num_a, u), dtype)
+#             X0_shared = T.alloc_shared((num_i, u), dtype)
+#             # cg_shared = T.alloc_shared((block_M,), dtype)
+
+#             # Z_local = T.alloc_fragment((u,), accum_dtype)
+#             # T.clear(Z_local)
+
+#             acc = T.alloc_fragment((1,), accum_dtype)
+#             acc[0] = 0.0
+
+#             T.copy(X1[b_idx, :, :], X1_shared)
+#             T.copy(X0[b_idx, :, :], X0_shared)
+
+#             T.sync_threads()
+
+#             for p in T.serial(path_num):
+#                 coeff = cg[p]
+#                 len_p = path_lens[p]
+#                 a = paths[p, 0]
+#                 i = paths[p, 1] if len_p == 3 else paths[p, len_p - 2]
+
+#                 val = T.alloc_fragment((1,), dtype)          
+#                 val[0] = X1_shared[a, u_idx] 
+#                 if len_p >= 4:
+#                     b = paths[p, 1]
+#                     val[0] *= X1_shared[b, u_idx]         # x1[b, u]
+#                 if len_p == 5:
+#                     c = paths[p, 2]
+#                     val[0] *= X1_shared[c, u_idx]         # x1[c, u]
+#                 val[0] *= X0_shared[i, u_idx]             # x0[i, u]
+#                 val[0] *= coeff
+#                 acc[0] += val[0]
+
+#             T.atomic_add(out[b_idx, u_idx], acc[0])
+
+#     return main
+
 @tilelang.jit
-def forward(B, U, V, W, dim,
+def forward(B, num_a, num_i, u, path_num, 
             dtype="float16", 
             accum_dtype="float32",
-            threads=128):
+            threads=96):
     
     # tile
-    block_B = 64
-    block_W = 64
-    block_UV = 64
-    block_U = 64
+    block_B = 16
+    block_U = 96
+
+    total = B * u
 
     @T.prim_func
     def main(
-            X: T.Tensor((B, U, dim), dtype), # type: ignore
-            Y: T.Tensor((B, V), dtype), # type: ignore
-            W_tensor: T.Tensor((U*V, W), dtype), # type: ignore
-            Z: T.Tensor((B*dim, W), dtype), # type: ignore
+            X1: T.Tensor((B, num_a, u), dtype), # type: ignore
+            X0: T.Tensor((B, num_i, u), dtype), # type: ignore
+            cg: T.Tensor((path_num,), dtype), # type: ignore
+            paths: T.Tensor((path_num, 5), "int32"), # type: ignore
+            path_lens: T.Tensor((path_num,), "int32"), # type: ignore
+            out: T.Tensor((B, u), dtype), # type: ignore
     ):
-        T.func_attr({"tir.noalias": True})
-        T.func_attr({"tl.copy_vectorize": 4}) 
-
-        with T.Kernel(T.ceildiv(B*dim, block_B), T.ceildiv(W, block_W), threads=threads) as (b_idx, w_idx):
+        T.func_attr({"tir.noalias": True, "tl.copy_vectorize": 4})
+        
+        with T.Kernel(T.ceildiv(B, block_B), T.ceildiv(u, threads), threads=threads) as (b_blk, t_blk):
             
-            Y_shared = T.alloc_shared((block_B, V), dtype)
+            tx = T.thread_binding(0, threads, "threadIdx.x")
+            b_base = b_blk * block_B
+            # u_base = u_blk * block_U
+            u_idx  = t_blk * threads + tx
 
-            A_shared = T.alloc_shared((block_B, block_UV), dtype)
-            B_shared = T.alloc_shared((block_UV, block_W), dtype)
+            X1_shared = T.alloc_shared((block_B, num_a, u), dtype)
+            X0_shared = T.alloc_shared((block_B, num_i, u), dtype)
 
-            C_local = T.alloc_fragment((block_B, block_W), accum_dtype)
-            T.clear(C_local)
+            acc = T.alloc_fragment((block_B,), accum_dtype)
+            T.clear(acc)
 
-            base_i = b_idx * block_B
-            for i, v in T.Parallel(block_B, V):
-                b = (base_i + i) // dim
-                Y_shared[i, v] = Y[b, v]
+            T.copy(X1[b_base, 0, 0], X1_shared)
+            T.copy(X0[b_base, 0, 0], X0_shared)
 
-            # data_shared
-            for ko in T.Pipelined(T.ceildiv(U*V, block_UV), num_stages=4):
-                T.copy(W_tensor[ko * block_UV, w_idx * block_W], B_shared)
+            T.sync_threads()
 
-                base_k = ko * block_UV
-                for i, j in T.Parallel(block_B, block_UV):
-                    b = (base_i + i) // dim
-                    d = (base_i + i) % dim
-                    u = (base_k + j) // V
-                    v = (base_k + j) % V
+            for p in T.serial(path_num):
+                coeff = cg[p]
+                len_p = path_lens[p]
+                a = paths[p, 0]
+                i = paths[p, 1] if len_p == 3 else paths[p, len_p - 2]
 
-                    A_shared[i, j] = X[b, u, d] * Y_shared[i, v]
+                for bi in T.serial(block_B):
+                    if u_idx < u:
+                        val = T.alloc_fragment((1,), dtype)          
+                        val[0] = X1_shared[bi, a, u_idx] 
+                        if len_p >= 4:
+                            b = paths[p, 1]
+                            val[0] *= X1_shared[bi, b, u_idx]         # x1[b, u]
+                        if len_p == 5:
+                            c = paths[p, 2]
+                            val[0] *= X1_shared[bi, c, u_idx]         # x1[c, u]
+                        val[0] *= X0_shared[bi, i, u_idx] * coeff            # x0[i, u]
+                        acc[bi] += val[0]
 
-                T.gemm(A_shared, B_shared, C_local)
-
-            T.copy(C_local, Z[b_idx * block_B, w_idx * block_W])
+            for bi in T.serial(block_B):
+                if u_idx < u:
+                    T.atomic_add(out[b_base + bi, u_idx], acc[bi])
 
     return main
 
-kernel = forward(5152, 96, 10, 96, 3)
+# 设置 CUDA 调试同步
+os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-@tilelang.jit
-def forward(B, U, V, W, dim,
-            dtype="float16", 
-            accum_dtype="float32",
-            threads=128):
-    
-    # tile
-    block_B = 64
-    block_W = 64
-    block_UV = 64
-    block_U = 64
+stp_kernel = load(
+    name="segmented_tensor_product_kernel",
+    sources=["baseline_cueq_stp.cu"],
+    verbose=True,
+    extra_cuda_cflags=[
+        "-gencode=arch=compute_90,code=sm_90"
+    ]
+)
 
-    @T.prim_func
-    def main(
-            X: T.Tensor((B, U, dim), dtype), # type: ignore
-            Y: T.Tensor((B, V), dtype), # type: ignore
-            W_tensor: T.Tensor((U*V, W), dtype), # type: ignore
-            Z: T.Tensor((B*dim, W), dtype), # type: ignore
-    ):
-        T.func_attr({"tir.noalias": True})
-        T.func_attr({"tl.copy_vectorize": 4}) 
-
-        with T.Kernel(T.ceildiv(B*dim, block_B), T.ceildiv(W, block_W), threads=threads) as (b_idx, w_idx):
-            
-            Y_shared = T.alloc_shared((block_B, V), dtype)
-
-            A_shared = T.alloc_shared((block_B, block_UV), dtype)
-            B_shared = T.alloc_shared((block_UV, block_W), dtype)
-
-            C_local = T.alloc_fragment((block_B, block_W), accum_dtype)
-            T.clear(C_local)
-
-            base_i = b_idx * block_B
-            for i, v in T.Parallel(block_B, V):
-                b = (base_i + i) // dim
-                Y_shared[i, v] = Y[b, v]
-
-            # data_shared
-            for ko in T.Pipelined(T.ceildiv(U*V, block_UV), num_stages=4):
-                T.copy(W_tensor[ko * block_UV, w_idx * block_W], B_shared)
-
-                base_k = ko * block_UV
-                for i, j in T.Parallel(block_B, block_UV):
-                    b = (base_i + i) // dim
-                    d = (base_i + i) % dim
-                    u = (base_k + j) // V
-                    v = (base_k + j) % V
-
-                    A_shared[i, j] = X[b, u, d] * Y_shared[i, v]
-
-                T.gemm(A_shared, B_shared, C_local)
-
-            T.copy(C_local, Z[b_idx * block_B, w_idx * block_W])
-
-    return main
+stc_fwd = load(
+    name="stc_fwd",
+    sources=["stc_fwd.cu"],
+    verbose=True,
+    extra_cuda_cflags=[
+        "-gencode=arch=compute_90,code=sm_90"
+    ]
+)
 
 # 参数设置
 B, u = 368, 96
@@ -146,7 +236,7 @@ num_paths = 94
 retry = 100
 
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-dtype = torch.float64
+dtype = torch.float16
 
 x1 = torch.randn(B, num_a, u, dtype=dtype, device=device)
 x0_g = torch.randn(B, num_i, u, dtype=dtype, device=device)
@@ -161,93 +251,12 @@ padded_paths = [p + [0] * (max_len - len(p)) for p in host_paths]
 paths_tensor = torch.tensor(padded_paths, dtype=torch.int, device=device)
 coeffs = torch.randn(len(path_lens_tensor), dtype=dtype, device=device)
 
-print(host_paths)
-
-print(len(path_lens_tensor))
-
-# baseline
-def baseline():
-    baseline_out = torch.zeros(B, u, dtype=dtype, device=device)
-    for path_idx in range(0, len(paths_tensor)):
-        path = paths_tensor[path_idx]
-        real_path_len = path_lens_tensor[path_idx]
-        if real_path_len == 3:
-            a = path[0]
-            i = path[1]
-            baseline_out += x1[:, a] * x0_g[:, i] * coeffs[path_idx]
-        if real_path_len == 4:
-            a = path[0]
-            b = path[1]
-            i = path[2]
-            baseline_out += x1[:, a] * x1[:, b] * x0_g[:, i] * coeffs[path_idx]
-        if real_path_len == 5:
-            a = path[0]
-            b = path[1]
-            c = path[2]
-            i = path[3]
-            baseline_out += x1[:, a] * x1[:, b] * x1[:, c] * x0_g[:, i] * coeffs[path_idx]
-    return baseline_out
-
-def baseline_opt():
-    baseline_out = torch.zeros(B, u, dtype=dtype, device=device)
-
-    # 按长度分 mask
-    len3_mask = path_lens_tensor == 3
-    len4_mask = path_lens_tensor == 4
-    len5_mask = path_lens_tensor == 5
-
-    print(len3_mask)
-
-    # ---------- len=3 ----------
-    if len3_mask.any():
-        idx = paths_tensor[len3_mask]                  # [M3, 2]
-        print(idx.shape)            
-        c3  = coeffs[len3_mask]                        # [M3]
-        x1_a = x1[:, idx[:, 0]]                      # [B, M3, u]
-        x0_leg = x0_g[:, idx[:, 1]]                    # [B, M3, u]
-        baseline_out += torch.einsum('bmu,bmu,m->bu', x1_a, x0_leg, c3)
-
-    # ---------- len=4 ----------
-    if len4_mask.any():
-        idx = paths_tensor[len4_mask]                  # [M4, 3]
-        print(idx.shape)  
-        c4  = coeffs[len4_mask]
-        x1_ab = x1[:, idx[:, 0]] * x1[:, idx[:, 1]]   # [B, M4, u]
-        x0_leg = x0_g[:, idx[:, 2]]                   # [B, M4, u]
-        baseline_out += torch.einsum('bmu,bmu,m->bu', x1_ab, x0_leg, c4)
-
-    # ---------- len=5 ----------
-    if len5_mask.any():
-        idx = paths_tensor[len5_mask]                  # [M5, 4]
-        print(idx.shape)  
-        c5  = coeffs[len5_mask]
-        x1_abc = x1[:, idx[:, 0]] * x1[:, idx[:, 1]] * x1[:, idx[:, 2]]  # [B, M5, u]
-        x0_leg = x0_g[:, idx[:, 3]]                    # [B, M5, u]
-        baseline_out += torch.einsum('bmu,bmu,m->bu', x1_abc, x0_leg, c5)
-
-    return baseline_out
-
-
-
-# 计时器
-def benchmark(fn, label, retry=1):
-    # torch.cuda.synchronize()
-    # start = time.perf_counter() * 1000
-    for retry_id in range(0, retry):
-
-        torch.cuda.synchronize()
-        start = time.perf_counter() * 1000
-        out = fn()
-        torch.cuda.synchronize()
-        end = time.perf_counter() *1000
-        if retry_id == retry - 1:
-            t = end - start
-    return label, out, t
+# print(host_paths)
+# print(path_lens_tensor)
 
 ### baseline ###
-out_baseline = torch.zeros(B, u, dtype=dtype, device=device)
-
 for retry_id in range(0, retry):
+    out_baseline = torch.zeros(B, u, dtype=dtype, device=device)
 
     torch.cuda.synchronize()
     start = time.perf_counter() * 1000
@@ -276,34 +285,38 @@ for retry_id in range(0, retry):
     if retry_id == retry - 1:
         print(f"baseline time: {t1} ms")
 
+# ### baseline_cuda ###
+# for retry_id in range(0, retry):
+#     out_baseline_cuda = torch.zeros(B, u, dtype=dtype, device=device) 
+
+#     torch.cuda.synchronize()
+#     start = time.perf_counter() * 1000
+
+#     stp_kernel.segmented_tensor_product(
+#         x1, x0_g, coeffs, paths_tensor, path_lens_tensor, out_baseline_cuda
+#     )
+
+#     torch.cuda.synchronize()
+#     end = time.perf_counter() *1000
+#     t3 = end - start
+#     if retry_id == retry - 1:
+#         print(f"baseline_cuda time: {t3} ms")
 
 ### test ###
-out_test = torch.zeros(B, u, dtype=dtype, device=device)
-
-# 按长度分 mask
-# len3_mask = path_lens_tensor == 3
-# len4_mask = path_lens_tensor == 4
-# len5_mask = path_lens_tensor == 5
-
-# print(len3_mask)
-K = 8
-retry = 100
+# kernel = forward(B, num_a, num_i, u, 77)
 for retry_id in range(0, retry):
-
-    torch.cuda.synchronize()
-    start = time.perf_counter() * 1000
+    out_test = torch.zeros(B, u, dtype=dtype, device=device)
 
     len3_mask = path_lens_tensor == 3
     len4_mask = path_lens_tensor == 4
     len5_mask = path_lens_tensor == 5
+
+    # torch.cuda.synchronize()
+    # start = time.perf_counter() * 1000
     # ---------- len=3 ----------
     if len3_mask.any():
-        idx = paths_tensor[len3_mask]                  # [M3, 2]
-        # if retry_id == retry - 1:
-        #     print(idx.shape)            
+        idx = paths_tensor[len3_mask]                  # [M3, 2]        
         c3  = coeffs[len3_mask]                        # [M3]
-        # if retry_id == retry - 1:
-        #     print(c3)
         x1_leg = x1[:, idx[:, 0]]                      # [B, M3, u]
         x0_leg = x0_g[:, idx[:, 1]]                    # [B, M3, u]
         # out_test += torch.einsum('bmu,bmu,m->bu', x1_leg, x0_leg, c3)
@@ -313,11 +326,7 @@ for retry_id in range(0, retry):
     # ---------- len=4 ----------
     if len4_mask.any():
         idx = paths_tensor[len4_mask]                  # [M4, 3]
-        # if retry_id == retry - 1:
-        #     print(idx.shape)  
         c4  = coeffs[len4_mask]
-        # if retry_id == retry - 1:
-        #     print(c4)
         x1_ab = x1[:, idx[:, 0]] * x1[:, idx[:, 1]]   # [B, M4, u]
         x0_leg = x0_g[:, idx[:, 2]]                   # [B, M4, u]
         # out_test += torch.einsum('bmu,bmu,m->bu', x1_ab, x0_leg, c4)
@@ -326,24 +335,68 @@ for retry_id in range(0, retry):
 
     # ---------- len=5 ----------
     if len5_mask.any():
+
         idx = paths_tensor[len5_mask]                  # [M5, 4]
-        # if retry_id == retry - 1:
-        #     print(idx.shape)  
         c5  = coeffs[len5_mask]
+        d5 = path_lens_tensor[len5_mask]
+        
+        if retry_id == retry - 1:
+            print(c5)
+            # print(idx)
+            print(idx)
+            print(idx[:, 0])
+
         x1_abc = x1[:, idx[:, 0]] * x1[:, idx[:, 1]] * x1[:, idx[:, 2]]  # [B, M5, u]
-        x0_leg = x0_g[:, idx[:, 3]]                    # [B, M5, u]
+        x0_leg = x0_g[:, idx[:, 3]]               # [B, M5, u]
         # out_test += torch.einsum('bmu,bmu,m->bu', x1_abc, x0_leg, c5)
-        contrib = (x1_abc * x0_leg)            # [B,M3,u]
-        out_test += contrib.mul(c5.view(1, -1, 1)).sum(dim=1)  # [B,u]
+        contrib = (x1_abc * x0_leg)            
+        out_test += contrib.mul(c5.view(1, -1, 1)).sum(dim=1)
+        # out_test += out_tilelang1
+
+    # torch.cuda.synchronize()
+    # end = time.perf_counter() *1000
+    # t2 = end - start
+    # if retry_id == retry - 1:
+    #     print(f"baseline_opt time: {t2} ms")
+
+# ### opt_cuda ###
+# for retry_id in range(0, retry):
+
+#     torch.cuda.synchronize()
+#     start = time.perf_counter() * 1000
+
+#     out = stc_fwd.forward(
+#         x1, x0_g, coeffs, paths_tensor, path_lens_tensor
+#     )
+
+#     torch.cuda.synchronize()
+#     end = time.perf_counter() *1000
+#     t4 = end - start
+#     if retry_id == retry - 1:
+#         print(f"opt_cuda time: {t4} ms")
+
+### tilelang ###
+kernel = forward(B, num_a, num_i, u, 94)
+for retry_id in range(0, retry):
+    out_tilelang = torch.zeros(B, u, dtype=dtype, device=device)
+
+    torch.cuda.synchronize()
+    start = time.perf_counter() * 1000
+
+    kernel(x1, x0_g, coeffs, paths_tensor, path_lens_tensor, out_tilelang)
 
     torch.cuda.synchronize()
     end = time.perf_counter() *1000
-    t2 = end - start
+    t5 = end - start
     if retry_id == retry - 1:
-        print(f"compute time: {t2} ms")
+        print(f"tilelang time: {t5} ms")
 
 err = (out_baseline - out_test).abs()
-print(f"error: {err.max().item()}")
-print(f"speedup: {(t1/t2):.4f}x")
+print(f"test_error: {err.max().item()}")
+# print(f"speedup: {(t1/t2):.4f}x")
+
 # print(out_baseline)
-# print(out_test)
+# print(out_tilelang)
+
+err = (out_baseline - out_tilelang).abs()
+print(f"tilelang_error: {err.max().item()}")
