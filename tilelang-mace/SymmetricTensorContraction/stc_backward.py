@@ -23,186 +23,237 @@ warnings.filterwarnings(
 )
 torch.manual_seed(42)
 
-
-@tilelang.jit
-def backward(B, num_a, num_i, u, path_num, 
-            dtype="float16", 
-            accum_dtype="float16",
-            threads=96):
-    
-    # tile
-    block_B = 16
-    block_U = 96
-
-    @T.prim_func
-    def main(
-            grad_out: T.Tensor((B, u), dtype), # type: ignore
-            X1: T.Tensor((B, num_a, u), dtype), # type: ignore
-            X0: T.Tensor((B, num_i, u), dtype), # type: ignore
-            cg: T.Tensor((path_num,), dtype), # type: ignore
-            paths: T.Tensor((path_num, 5), "int32"), # type: ignore
-            path_lens: T.Tensor((path_num,), "int32"), # type: ignore
-            grad_x: T.Tensor((B, num_a, u), dtype), # type: ignore
-    ):
-        T.func_attr({"tir.noalias": True, "tl.copy_vectorize": 4})
-        
-        with T.Kernel(T.ceildiv(B, block_B), T.ceildiv(u, block_U), threads=threads) as (b_blk, u_blk):
-            
-            tx = T.thread_binding(0, threads, "threadIdx.x")
-            b_base = b_blk * block_B
-            u_base = u_blk * block_U
-            u_idx  = u_base + tx
-
-            X1_shared = T.alloc_shared((block_B, num_a, u), dtype)
-            X0_shared = T.alloc_shared((block_B, num_i, u), dtype)
-            grad_out_shared = T.alloc_shared((block_B, u), dtype)
-
-            T.copy(X1[b_base, 0, 0], X1_shared)
-            T.copy(X0[b_base, 0, 0], X0_shared)
-            T.copy(grad_out[b_base, 0], grad_out_shared)
-
-            T.sync_threads()
-
-            for p in T.serial(path_num):
-                coeff = cg[p]
-                len_p = path_lens[p]
-                a = paths[p, 0]
-                i = paths[p, 1] if len_p == 3 else paths[p, len_p - 2]
-
-                for bi in T.serial(block_B):
-                    base = grad_out_shared[bi, u_idx] * coeff * X0_shared[bi, i, u_idx]
-
-                    if len_p == 3:
-                        T.atomic_add(grad_x[b_base + bi, a, u_idx], base)
-                    if len_p == 4:
-                        b = paths[p, 1]
-                        base_1 = base * X1_shared[bi, b, u_idx]
-                        base_2 = base * X1_shared[bi, a, u_idx]
-                        T.atomic_add(grad_x[b_base + bi, a, u_idx], base_1) 
-                        T.atomic_add(grad_x[b_base + bi, b, u_idx], base_2)    
-                    if len_p == 5:
-                        b = paths[p, 1]
-                        c = paths[p, 2]
-                        base_3 = base * X1_shared[bi, b, u_idx] * X1_shared[bi, c, u_idx]
-                        base_4 = base * X1_shared[bi, a, u_idx] * X1_shared[bi, c, u_idx]
-                        base_5 = base * X1_shared[bi, a, u_idx] * X1_shared[bi, b, u_idx]
-
-                        T.atomic_add(grad_x[b_base + bi, a, u_idx], base_3) 
-                        T.atomic_add(grad_x[b_base + bi, b, u_idx], base_4)
-                        T.atomic_add(grad_x[b_base + bi, c, u_idx], base_5)
-    return main
-
-# 设置 CUDA 调试同步
-os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
-stc_bwd = load(
-    name="stc_bwd",
-    sources=["stc_bwd.cu"],
+cwtp_bwd = load(
+    name="cwtp_bwd",
+    sources=["cwtp_bwd.cu"],
     verbose=True,
     extra_cuda_cflags=[
         "-gencode=arch=compute_90,code=sm_90"
     ]
 )
 
-# 参数设置
-B, u = 368, 96
-num_a = num_b = num_c = 16
-num_i = 13
-num_paths = 94
+@tilelang.jit
+def backward(B, U, dim, threads=128, dtype="float64", accum_dtype="float64"):
+    
+    block_B = 32
+    total = U * dim
+
+    @T.prim_func
+    def main(
+        grad_out: T.Tensor((B, dim, U), dtype), # type: ignore
+        X: T.Tensor((B, U), dtype), # type: ignore
+        Y: T.Tensor((B, dim), dtype), # type: ignore
+        W: T.Tensor((B, U), dtype), # type: ignore
+        B_buf: T.Tensor((B, U), dtype), # type: ignore
+        grad_X: T.Tensor((B, U), dtype), # type: ignore
+        grad_Y: T.Tensor((B, dim), dtype), # type: ignore
+        grad_W: T.Tensor((B, U), dtype), # type: ignore
+    ):
+        with T.Kernel(T.ceildiv(B, block_B), T.ceildiv(total, threads), threads=threads) as (b_idx, t_idx):
+            t = T.thread_binding(0, threads, thread="threadIdx.x")
+            tid = t_idx * threads + t
+
+            grad_W_shared = T.alloc_shared((block_B, U), accum_dtype)
+
+            for i in T.serial(T.ceildiv(U, threads)):
+                idx = i * threads + t
+                if idx < U:
+                    grad_W_shared[b_idx * block_B, idx] = 0
+
+            T.sync_threads()
+
+            for bi in T.serial(block_B):
+                b = b_idx * block_B + bi
+
+                if tid < total:
+
+                    tmp = tid
+                    u = tmp // dim
+                    i = tmp % dim
+
+                    xv = T.cast(X[b, u], dtype)
+                    yv = T.cast(Y[b, i], dtype)
+                    wv = T.cast(W[B, u], dtype)
+                    g = T.cast(grad_out[b, u, i], dtype)
+
+                    T.atomic_add(grad_X[b, u], g * yv * wv)
+                    T.atomic_add(grad_Y[b, i], g * xv * wv)
+                    T.atomic_add(grad_W_shared[b, u], g * xv * yv)
+
+            T.sync_threads()
+            
+            for i in T.serial(T.ceildiv(U, threads)):
+                idx = i * threads + t
+                if idx < U:
+                    if grad_W_shared[b_idx, idx] != 0:
+                        T.atomic_add(grad_W[b_idx * block_B, idx], grad_W_shared[b_idx, idx])
+    return main
+
+B = 368
+U = 96
+V = 1
 
 retry = 100
 
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-dtype = torch.float16
+dtype=torch.float64
 
-x1 = torch.randn(B, num_a, u, dtype=dtype, device=device)
-x0_g = torch.randn(B, num_i, u, dtype=dtype, device=device)
+#### cuequivarance ####
+irreps_in1 = cue.Irreps("O3", "96x0e")
+irreps_in2 = cue.Irreps("O3", "1x0e+1x1o+1x2e+1x3o")
+irreps_out = cue.Irreps("O3", "96x0e+96x1o+96x2e+96x3o")
 
+tp_cueq = cueq.ChannelWiseTensorProduct(
+    irreps_in1, irreps_in2, 
+    filter_irreps_out = irreps_out, 
+    layout=cue.ir_mul,
+    shared_weights=False,     
+    internal_weights=False,
+    device=device     
+)
 
-with open("cg_coeff_paths.txt", "r") as f:
-    data = f.read()
-host_paths = ast.literal_eval(data)
-path_lens_tensor = torch.tensor([len(p) for p in host_paths], dtype=torch.int, device=device)
-max_len = max(len(p) for p in host_paths)
-padded_paths = [p + [0] * (max_len - len(p)) for p in host_paths]
+X = torch.randn(B, irreps_in1.dim, dtype=dtype, device=device, requires_grad=True)
+Y = torch.randn(B, irreps_in2.dim, dtype=dtype, device=device, requires_grad=True)
+W = torch.randn(B, tp_cueq.weight_numel, dtype=dtype, device=device, requires_grad=True)
+Z = torch.zeros(B, U, device=device, dtype=dtype)
 
-paths_tensor = torch.tensor(padded_paths, dtype=torch.int, device=device)
-coeffs = torch.randn(len(path_lens_tensor), dtype=dtype, device=device)
+# print(X.shape)
+# print(Y.shape)
 
-print(paths_tensor.shape)
+print(f"irreps_in1: {irreps_in1.dim}, irreps_in2: {irreps_in2.dim}, irreps_out: {irreps_out.dim}, weight: {tp_cueq.weight_numel}")
 
-grad_out = torch.randn(B, u, dtype=dtype, device=device)
+instr = [
+    (i_1, i_2, i_out, 'uvu', True, 1.0)
+    for i_1, (mul1, ir_1) in enumerate(irreps_in1)     # i:编号
+    for i_2, (mul2, ir_2) in enumerate(irreps_in2)     # mul:通道数
+    for i_out, (mul3, ir_out) in enumerate(irreps_out) # ir.l:角量
+    if ir_out in ir_1 * ir_2
+]
 
-# for retry_id in range(0, retry):
-#     torch.cuda.synchronize()
-#     start = time.perf_counter() * 1000
+dim_list = [
+    (2 * ir_2.l + 1)
+    for i_1, (_, ir_1) in enumerate(irreps_in1)
+    for i_2, (_, ir_2) in enumerate(irreps_in2)
+    for i_out, (_, ir_out) in enumerate(irreps_out)
+    if ir_out in ir_1 * ir_2
+]
 
-#     grad_x1_cuda = stc_bwd.backward(
-#         grad_out, x1, x0_g, coeffs, paths_tensor, path_lens_tensor
-#     )
+cg_list = [
+    (ir_1.l, ir_2.l, ir_out.l)
+    for i_1, (_, ir_1) in enumerate(irreps_in1)
+    for i_2, (_, ir_2) in enumerate(irreps_in2)
+    for i_out, (_, ir_out) in enumerate(irreps_out)
+    if ir_out in ir_1 * ir_2
+]
+path_num = len(instr)
 
-#     torch.cuda.synchronize()
-#     end = time.perf_counter() *1000
-#     t1 = end - start
-#     if retry_id == retry - 1:
-#         print(f"opt_cuda time: {t1} ms")
+### cueq ###
+out_cueq = tp_cueq(X, Y, W)
+grad_output = torch.ones_like(out_cueq)
+print(grad_output.shape)
 
 for retry_id in range(0, retry):
+    if retry_id != 0:
+        X.grad.zero_(), Y.grad.zero_(), W.grad.zero_()
 
-    grad_x1_baseline = torch.zeros_like(x1)
-
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device=device)
     start = time.perf_counter() * 1000
-    for path_idx in range(0, len(paths_tensor)):
-        path = paths_tensor[path_idx]
-        real_path_len = path_lens_tensor[path_idx]
-        
-        if real_path_len == 3:
-            a = path[0]
-            i = path[1]
-            grad_x1_baseline[:, a] += grad_out * x0_g[:, i] * coeffs[path_idx]
-        elif real_path_len == 4:
-            a = path[0]
-            b = path[1]
-            i = path[2]
-            grad_x1_baseline[:, a] += grad_out * x1[:, b] * x0_g[:, i] * coeffs[path_idx]
-            grad_x1_baseline[:, b] += grad_out * x1[:, a] * x0_g[:, i] * coeffs[path_idx] 
-        elif real_path_len == 5:
-            a = path[0]
-            b = path[1]
-            c = path[2]
-            i = path[3]
-            grad_x1_baseline[:, a] += grad_out * x1[:, b] * x1[:, c] * x0_g[:, i] * coeffs[path_idx]
-            grad_x1_baseline[:, b] += grad_out * x1[:, a] * x1[:, c] * x0_g[:, i] * coeffs[path_idx]
-            grad_x1_baseline[:, c] += grad_out * x1[:, a] * x1[:, b] * x0_g[:, i] * coeffs[path_idx]
 
-    torch.cuda.synchronize()
+    out_cueq.backward(grad_output, retain_graph=True)
+
+    torch.cuda.synchronize(device=device)
     end = time.perf_counter() * 1000
-    t2 = end - start
     if retry_id == retry - 1:
-        print(f"baseline time: {t2} ms")    
+        print(f"cueq time: {(end - start):.4f} ms")
 
-# err = (grad_x1 - grad_x1_baseline).abs()
-# print(f"baseline error: {err.max().item()}")
+grad_X_cueq = X.grad.clone()
+grad_Y_cueq = Y.grad.clone()
+grad_W_cueq = W.grad.clone()
 
-kernel = backward(B, num_a, num_i, u, num_paths)
+### cuda ###
+W_reshaped = W.reshape(B, -1, U)
+B_buf = X.unsqueeze(1) * W_reshaped
 for retry_id in range(0, retry):
-    grad_x1_tilelang = torch.zeros_like(x1)
-
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device=device)
     start = time.perf_counter() * 1000
 
-    kernel(grad_out, x1, x0_g, coeffs, paths_tensor, path_lens_tensor, grad_x1_tilelang)
+    grad_X_cuda, grad_Y_cuda, grad_W_cuda = cwtp_bwd.backward(grad_output, X, Y, W, B_buf)
 
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device=device)
     end = time.perf_counter() * 1000
-    t3 = end - start
     if retry_id == retry - 1:
-        print(f"tilelang time: {t3} ms")
+        print(f"cuda time: {(end - start):.4f} ms")
 
-err = (grad_x1_baseline - grad_x1_tilelang).abs()
-print(f"error: {err.max().item()}")
-# print(grad_x1_cuda)
-# print(grad_x1_tilelang)
-# print(grad_x1_baseline)
+print(grad_W_cueq.shape)
+
+cuda_err = max((grad_X_cueq - grad_X_cuda).abs().max(), (grad_Y_cueq - grad_Y_cuda).abs().max(), (grad_W_cueq - grad_W_cuda).abs().max())
+print(f"cuda_err: {cuda_err.item()}")
+
+### torch.einsum ###
+for retry_id in range(0, retry):
+    dim_offset = 0
+    grad_X_einsum = torch.zeros_like(X)
+    grad_Y = []
+    grad_W = []
+
+    torch.cuda.synchronize(device=device)
+    start = time.perf_counter() * 1000
+    for dim_idx in range(0, path_num):
+        dim = dim_list[dim_idx]
+
+        x = X                                   # (B, U)
+        y = Y[:, dim_offset:dim_offset + dim]   # (B, 1+3+5+7)
+        w = W_reshaped[:, dim_idx]              # (B, 4, U)
+        grad_out = grad_output[:, dim_offset * U: (dim_offset + dim) * U].reshape(B, -1, U)
+        b_buf = B_buf[:, dim_idx]
+
+        grad_x = torch.einsum("biu,bi,bu->bu", grad_out, y, w)
+        grad_X_einsum += grad_x
+
+        grad_y = torch.einsum("biu,bu->bi", grad_out, b_buf)
+        grad_Y.append(grad_y)
+
+        grad_w = torch.einsum("biu,bu,bi->bu", grad_out, x, y)
+        grad_W.append(grad_w)
+
+        dim_offset += dim
+
+    grad_Y_einsum = torch.cat(grad_Y, dim=1)
+    grad_W_einsum = torch.cat(grad_W, dim=1)
+
+    torch.cuda.synchronize(device=device)
+    end = time.perf_counter() * 1000
+    if retry_id == retry - 1:
+        print(f"torch time: {(end - start):.4f} ms")
+
+torch_err = max((grad_X_cueq - grad_X_einsum).abs().max(), (grad_Y_cueq - grad_Y_einsum).abs().max(), (grad_W_cueq - grad_W_cuda).abs().max()) 
+print(f"torch_err: {torch_err.item()}")
+
+### tilelang ###
+dim_offset = 0
+grad_X_tilelang = torch.zeros_like(X)
+grad_Y = []
+grad_W = []
+for dim_idx in range(0, path_num):
+    dim = dim_list[dim_idx]
+    kernel = backward(B, U, dim)
+
+    x = X                                   # (B, U)
+    y = Y[:, dim_offset:dim_offset + dim]   # (B, 1+3+5+7)
+    w = W_reshaped[:, dim_idx]              # (B, 4, U)
+    grad_out = grad_out = grad_output[:, dim_offset * U: (dim_offset + dim) * U].reshape(B, -1, U).contiguous()
+    b_buf = B_buf[:, dim_idx, :].contiguous()
+
+    grad_x = torch.zeros(B, U, dtype=torch.float64, device=device)
+    grad_y = torch.zeros(B, dim, dtype=torch.float64, device=device)
+    grad_w = torch.zeros(B, U, dtype=torch.float64, device=device)
+
+    # kernel(grad_out, x, y, w, b_buf, grad_x, grad_y, grad_w)
+    # grad_X_tilelang += grad_x
+    # grad_Y.appned(grad_y)
+    # grad_W.append(grad_w)
+
+    dim_offset += dim
+
+# grad_Y_tilelang = torch.cat(grad_Y, dim=1)
+# grad_W_tilelang = torch.cat(grad_W, dim=1)
